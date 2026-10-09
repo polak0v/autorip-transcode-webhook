@@ -1,0 +1,69 @@
+############################
+# Stage 1: build libvpl + ffmpeg with QSV
+############################
+FROM ubuntu:24.04 AS builder
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential cmake git pkg-config yasm nasm \
+    libva-dev libdrm-dev \
+    python3 meson ninja-build \
+    ca-certificates wget \
+    && rm -rf /var/lib/apt/lists/*
+
+# --- libvpl (Intel's oneVPL dispatcher) ---
+RUN git clone --depth 1 https://github.com/intel/libvpl.git /src/libvpl && \
+    cmake -S /src/libvpl -B /src/libvpl/build \
+        -DCMAKE_INSTALL_PREFIX=/opt/intel/vpl \
+        -DCMAKE_BUILD_TYPE=Release && \
+    cmake --build /src/libvpl/build --parallel "$(nproc)" && \
+    cmake --install /src/libvpl/build
+
+# --- ffmpeg, configured against libvpl for QSV + VAAPI ---
+ENV PKG_CONFIG_PATH=/opt/intel/vpl/lib/pkgconfig:${PKG_CONFIG_PATH}
+RUN git clone --depth 1 --branch release/7.1 https://git.ffmpeg.org/ffmpeg.git /src/ffmpeg && \
+    cd /src/ffmpeg && \
+    ./configure \
+        --prefix=/usr/local \
+        --enable-gpl \
+        --enable-nonfree \
+        --enable-libvpl \
+        --enable-vaapi \
+        --disable-doc \
+        --disable-debug \
+        --enable-shared \
+        --disable-static && \
+    make -j"$(nproc)" && \
+    make install
+
+############################
+# Stage 2: runtime
+############################
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    LIBVA_DRIVER_NAME=iHD \
+    LD_LIBRARY_PATH=/usr/local/lib:/opt/intel/vpl/lib \
+    PATH=/usr/local/bin:${PATH} \
+    ONEVPL_SEARCH_PATH=/opt/intel/vpl/lib
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libmfx1 libmfx-tools \
+    libva2 libva-drm2 libdrm2 vainfo \
+    intel-media-va-driver-non-free \
+    python3 python3-pip \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /usr/local /usr/local
+COPY --from=builder /opt/intel/vpl /opt/intel/vpl
+
+RUN pip3 install --no-cache-dir --break-system-packages fastapi uvicorn[standard]
+
+WORKDIR /app
+COPY webhook_server.py .
+
+# runs as a member of the host's render group at container run time
+# (see docker-compose group_add) so it can open /dev/dri/renderD128
+CMD ["python3", "-m", "uvicorn", "webhook_server:app", "--host", "0.0.0.0", "--port", "9000"]

@@ -1,0 +1,24 @@
+services:
+  autorip-transcode-webhook:
+    build:
+      context: ./autorip-transcode-webhook
+      dockerfile: docker/ubuntu/Dockerfile.qsv
+    container_name: autorip-transcode-webhook
+    restart: unless-stopped
+    ports:
+      - "9000:9000"
+    devices:
+      - /dev/dri:/dev/dri
+    group_add:
+      - 44
+      - 109
+    environment:
+      - PUID=1003
+      - PGID=1004
+      - TRANSCODE_OUTPUT_DIR=/transcoded
+      - GLOBAL_QUALITY=24
+      - AUDIO_CODEC=copy
+      - DELETE_SOURCE=false
+    volumes:
+      - ./media/completed:/output:ro   # matches autorip's output_dir
+      - ./media/transcoded:/transcoded

@@ -1,0 +1,121 @@
+############################
+# Stage 1: build gmmlib, iHD driver, libvpl, ffmpeg
+############################
+FROM alpine:3.21 AS builder
+
+RUN apk add --no-cache \
+    build-base cmake git pkgconf yasm nasm \
+    libva-dev linux-headers \
+    python3 meson ninja \
+    bash ca-certificates
+
+# --- gmmlib (dependency of intel-media-driver) ---
+RUN git clone --depth 1 --branch intel-gmmlib-22.5.5 \
+        https://github.com/intel/gmmlib.git /src/gmmlib && \
+    cmake -S /src/gmmlib -B /src/gmmlib/build \
+        -DCMAKE_INSTALL_PREFIX=/usr \
+        -DCMAKE_INSTALL_LIBDIR=/usr/lib \
+        -DCMAKE_BUILD_TYPE=Release && \
+    cmake --build /src/gmmlib/build --parallel "$(nproc)" && \
+    cmake --install /src/gmmlib/build
+
+# --- intel-media-driver (the iHD VAAPI driver QSV rides on) ---
+RUN git clone --depth 1 --branch intel-media-24.4.4 \
+        https://github.com/intel/media-driver.git /src/media-driver && \
+    cmake -S /src/media-driver -B /src/media-driver/build \
+        -DCMAKE_INSTALL_PREFIX=/usr \
+        -DCMAKE_INSTALL_LIBDIR=/usr/lib \
+        -DCMAKE_BUILD_TYPE=Release && \
+    cmake --build /src/media-driver/build --parallel "$(nproc)" && \
+    cmake --install /src/media-driver/build
+# driver lands at /usr/lib/dri/iHD_drv_video.so
+
+# --- libvpl (Intel's oneVPL dispatcher) ---
+RUN git clone --depth 1 --branch v2.14.0 \
+        https://github.com/intel/libvpl.git /src/libvpl && \
+    cmake -S /src/libvpl -B /src/libvpl/build \
+        -DCMAKE_INSTALL_PREFIX=/usr \
+        -DCMAKE_INSTALL_LIBDIR=lib \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DBUILD_TOOLS=ON && \
+    cmake --build /src/libvpl/build --parallel "$(nproc)" && \
+    cmake --install /src/libvpl/build
+
+# --- vpl-gpu-rt (libmfx-gen — the actual MFX implementation) ---
+RUN git clone --depth 1 --branch intel-onevpl-25.2.4 \
+        https://github.com/intel/vpl-gpu-rt.git /src/vpl-gpu-rt && \
+    cmake -S /src/vpl-gpu-rt -B /src/vpl-gpu-rt/build \
+        -DCMAKE_INSTALL_PREFIX=/usr \
+        -DCMAKE_INSTALL_LIBDIR=lib \
+        -DCMAKE_BUILD_TYPE=Release && \
+    cmake --build /src/vpl-gpu-rt/build --parallel "$(nproc)" && \
+    cmake --install /src/vpl-gpu-rt/build
+
+# --- Intel Media SDK legacy runtime (libmfxhw64.so.1) — required for
+# Gen9–Gen11 iGPUs like Gemini Lake's UHD 600; vpl-gpu-rt only supports
+# Gen12+/Xe and has no implementation for this hardware at all ---
+RUN apk add --no-cache git-lfs perl && \
+    git lfs install && \
+    git clone --depth 1 https://github.com/Intel-Media-SDK/MediaSDK.git /src/msdk && \
+    cmake -S /src/msdk -B /src/msdk/build \
+        -DCMAKE_INSTALL_PREFIX=/usr \
+        -DCMAKE_INSTALL_LIBDIR=lib \
+        -DCMAKE_BUILD_TYPE=Release && \
+    cmake --build /src/msdk/build --parallel "$(nproc)" && \
+    cmake --install /src/msdk/build
+
+# --- for debugging with vpl-inspect
+RUN git clone --depth 1 --branch v2.14.0 \
+        https://github.com/intel/libvpl.git /src/libvpl && \
+    cmake -S /src/libvpl -B /src/libvpl/build \
+        -DCMAKE_INSTALL_PREFIX=/opt/intel/vpl \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DBUILD_TOOLS=ON && \
+    cmake --build /src/libvpl/build --parallel "$(nproc)" && \
+    cmake --install /src/libvpl/build
+
+# --- ffmpeg, configured against libvpl for QSV + VAAPI ---
+ENV PKG_CONFIG_PATH=/usr/lib/pkgconfig:${PKG_CONFIG_PATH}
+
+RUN git clone --depth 1 --branch release/7.1 https://git.ffmpeg.org/ffmpeg.git /src/ffmpeg && \
+    cd /src/ffmpeg && \
+    ./configure \
+        --prefix=/usr/local \
+        --enable-gpl \
+        --enable-nonfree \
+        --enable-libvpl \
+        --enable-vaapi \
+        --disable-doc \
+        --disable-debug \
+        --enable-shared \
+        --disable-static && \
+    make -j"$(nproc)" && \
+    make install
+
+############################
+# Stage 2: runtime
+############################
+FROM alpine:3.21
+
+ENV LIBVA_DRIVER_NAME=iHD \
+    LIBVA_DRIVERS_PATH=/usr/lib/dri \
+    LD_LIBRARY_PATH=/usr/local/lib \
+    PKG_CONFIG_PATH=/usr/lib/pkgconfig:${PKG_CONFIG_PATH}
+
+RUN apk add --no-cache \
+    libva libva-utils \
+    python3 py3-pip
+
+COPY --from=builder /usr/local /usr/local
+COPY --from=builder /usr/lib/dri /usr/lib/dri
+COPY --from=builder /usr/lib/libigdgmm* /usr/lib/
+COPY --from=builder /usr/lib/libmfx* /usr/lib/
+COPY --from=builder /usr/lib/libvpl* /usr/lib/
+COPY --from=builder /usr/bin/vpl-inspect /usr/bin/vpl-inspect
+
+RUN pip3 install --no-cache-dir --break-system-packages fastapi "uvicorn[standard]"
+
+WORKDIR /app
+COPY webhook_server.py .
+
+CMD ["python3", "-m", "uvicorn", "webhook_server:app", "--host", "0.0.0.0", "--port", "9000"]
