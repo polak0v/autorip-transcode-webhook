@@ -1,4 +1,4 @@
-# autorip-transcode-api
+# autorip-transcode-webhook
 
 Webhook for [freemkv autorip](https://freemkv.org/docs/autorip/). When a rip is moved to its final location, it transcodes the MKV to HEVC with Intel QSV.
 
@@ -13,6 +13,7 @@ Quality (`-global_quality`) is the same for all discs. Only `maxrate`/`bufsize` 
 | Tier   | maxrate / bufsize |
 |--------|-------------------|
 | dvd    | 2M / 4M           |
+| hd dvd | 4M / 8M           |
 | bluray | 8M / 16M          |
 | uhd    | 16M / 32M         |
 
